@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LOF套利监测</title>
+<style>
+body { font-family: Arial, sans-serif; padding: 20px; background: #111; color: #ddd; }
+table { border-collapse: collapse; width: 100%; }
+th, td { padding: 8px 12px; border-bottom: 1px solid #333; text-align: left; font-size: 13px; }
+th { color: #888; font-size: 11px; text-transform: uppercase; }
+.green { color: #0c0; } .red { color: #f44; } .orange { color: #f90; } .blue { color: #4af; }
+.code { font-family: monospace; color: #4af; }
+.error { color: #f44; padding: 40px; text-align: center; }
+.loading { text-align: center; padding: 40px; color: #888; }
+.loading::after { content: '...'; animation: dots 1s infinite; }
+@keyframes dots { 0%,20% { content: '.'; } 40% { content: '..'; } 60%,100% { content: '...'; } }
+</style>
+</head>
+<body>
+<h2>LOF套利监测</h2>
+<p id="status">加载中</p>
+<div id="table"></div>
+<script>
+var tbody = document.getElementById('table');
+var status = document.getElementById('status');
+
+function showError(msg) {
+  status.textContent = 'Error';
+  tbody.innerHTML = '<div class="error">' + msg + '</div>';
+}
+
+function formatAmount(a) {
+  if (!a) return '0万';
+  a = Number(a);
+  if (a >= 100000000) return (a/100000000).toFixed(1) + '亿';
+  if (a >= 10000) return (a/10000).toFixed(0) + '万';
+  return a.toFixed(0);
+}
+
+function formatLimit(l) {
+  if (!l || l <= 0) return '<span class="red">暂停</span>';
+  if (l >= 1e10) return '不限';
+  if (l >= 10000) return (l/10000).toFixed(0) + '万';
+  return l.toLocaleString();
+}
+
+function statusColor(s) {
+  if (!s) return 'red';
+  if (s.indexOf('暂停')>=0) return 'red';
+  if (s.indexOf('限大额')>=0) return 'orange';
+  return 'green';
+}
+
+function riskBadge(item) {
+  var l = item.ann_risk_level || '?';
+  if (l === 'safe') return '<span class="green">OK</span>';
+  if (l === 'danger') return '<span class="red">DANGER</span>';
+  if (l === 'warning') return '<span class="orange">WARN</span>';
+  if (l === 'resume') return '<span class="blue">RESUME</span>';
+  return l;
+}
+
+function buildTable(data) {
+  if (!data || data.length === 0) {
+    tbody.innerHTML = '<div class="error">No data</div>';
+    status.textContent = 'Empty';
+    return;
+  }
+  status.textContent = 'OK (' + data.length + ' records)';
+  var h = '<table><tr><th>代码</th><th>名称</th><th>场内价</th><th>净值</th><th>核实溢价</th><th>方向</th><th>成交额</th><th>申购状态</th><th>日限额</th><th>申购费</th><th>公告</th><th>操作</th></tr>';
+  for (var i = 0; i < data.length; i++) {
+    var item = data[i];
+    var p = item.premium_rt || 0;
+    var pc = p > 0 ? 'red' : 'green';
+    h += '<tr>';
+    h += '<td class="code">' + item.code + '</td>';
+    h += '<td>' + (item.name||'').substring(0,20) + '</td>';
+    h += '<td>' + (item.price||0).toFixed(3) + '</td>';
+    h += '<td>' + (item.nav||0).toFixed(4) + '</td>';
+    h += '<td class="' + pc + '">' + (p>0?'+':'') + p.toFixed(2) + '%</td>';
+    h += '<td>' + (item.is_premium ? '溢价' : '折价') + '</td>';
+    h += '<td>' + formatAmount(item.amount) + '</td>';
+    h += '<td class="' + statusColor(item.purchase_status) + '">' + (item.purchase_status||'?') + '</td>';
+    h += '<td>' + formatLimit(item.daily_limit) + '</td>';
+    h += '<td>' + ((item.purchase_fee||0).toFixed(2)) + '%</td>';
+    h += '<td>' + riskBadge(item) + '</td>';
+    h += '<td><a href="' + (item.ann_url || '#') + '" target="_blank" style="color:#4af">Link</a></td>';
+    h += '</tr>';
+  }
+  h += '</table>';
+  tbody.innerHTML = h;
+}
+
+status.textContent = 'Fetching...';
+fetch('/api/opportunities').then(function(r) { return r.json(); }).then(function(d) {
+  if (d.success) {
+    buildTable(d.data);
+  } else {
+    showError('API error: ' + (d.error || 'unknown'));
+  }
+}).catch(function(e) {
+  showError('Fetch failed: ' + e.message);
+});
+</script>
+</body>
+</html>
