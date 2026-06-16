@@ -11,6 +11,7 @@ import asyncio
 import time
 import json
 import re
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -142,6 +143,77 @@ async def fetch_jisilu_lof() -> Optional[list[dict]]:
     except Exception as e:
         print(f"[集思录] 异常: {e}")
         return None
+
+
+# ============================================================
+#  集思录 Playwright 登录 + Cookie 管理 + 全量数据获取
+#  解决直接POST登录被反爬的问题
+# ============================================================
+
+async def fetch_jisilu_data_full() -> Optional[dict[str, dict]]:
+    """
+    获取集思录全量 LOF 数据（含申购状态）。
+
+    数据来源：.jisilu_data.json（由外部 agent-browser 脚本生成）
+    自动化执行前需先运行 agent-browser 登录并抓取数据保存到此文件。
+
+    Returns:
+        {code: {"apply_status": "开放申购", "nav_discount_rt": 5.2, ...}}
+    """
+    import os as _os
+    # 项目根目录下的缓存文件
+    _jisilu_file = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".jisilu_data.json")
+
+    if not _os.path.exists(_jisilu_file):
+        print("[集思录全量] 缓存文件不存在，请先运行 agent-browser 抓取")
+        return None
+
+    mtime = _os.path.getmtime(_jisilu_file)
+    from datetime import datetime as _dt
+    age_hours = (_dt.now().timestamp() - mtime) / 3600
+
+    try:
+        with open(_jisilu_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        print(f"[集思录全量] 加载缓存（{age_hours:.1f}h前）: {len(data)} 只LOF")
+        return data
+    except Exception as e:
+        print(f"[集思录全量] 加载失败: {e}")
+        return None
+
+
+def enrich_with_jisilu_status(lof_data: list[dict], jisilu_info: dict[str, dict]) -> list[dict]:
+    """
+    用集思录的申购状态覆盖东财的"未知"申购状态。
+    集思录的 apply_status 更可靠（开放申购/暂停申购/限大额 等具体值）。
+
+    jisilu_info: fetch_jisilu_data_full() 的返回值
+    """
+    updated_count = 0
+    for item in lof_data:
+        code = item.get("code", "")
+        if code not in jisilu_info:
+            continue
+
+        jsl = jisilu_info[code]
+        jsl_status = jsl.get("apply_status", "")
+
+        # 只覆盖"未知"或空状态，保留已知的状态
+        current_status = item.get("purchase_status", "未知")
+        if current_status == "未知" or not current_status:
+            if jsl_status and jsl_status != "未知":
+                item["purchase_status"] = jsl_status
+                item["purchase_status_source"] = "jisilu"
+                updated_count += 1
+
+        # 同时补充 jisilu 的溢价率和净值（用于交叉验证参考）
+        item["jsl_nav_discount_rt"] = jsl.get("nav_discount_rt", 0)
+        item["jsl_fund_nav"] = jsl.get("fund_nav", 0)
+        item["jsl_apply_status"] = jsl_status
+
+    if updated_count > 0:
+        print(f"[集思录状态] 覆盖了 {updated_count} 只LOF的申购状态（未知→具体值）")
+    return lof_data
 
 
 # ============================================================
@@ -372,39 +444,80 @@ async def _fetch_fund_page_html(client: httpx.AsyncClient, code: str) -> Optiona
 
 
 def _parse_purchase_status_from_html(html: str) -> dict:
-    """从基金主页HTML中解析申购状态和限额"""
+    """从基金主页HTML中解析申购状态和限额
+    支持的HTML模式：
+    - 交易状态：暂停申购 （单日累计购买上限10元） 开放赎回
+    - 交易状态：开放申购 开放赎回
+    - 申购状态：开放申购
+    - 交易状态：暂停申购 暂停赎回（定开基金）
+    """
     result = {
         "purchase_status_raw": "",
         "daily_limit_raw": "",
         "fee_raw": "",
     }
 
-    # 申购状态通常在JS变量或data-属性中
-    # 模式1: data-status="..." 或 class 中包含状态信息
-    status_patterns = [
-        r'申购状态[：:]\s*([^<\s]+)',
-        r'data-purchasestatus="([^"]+)"',
-        r'"buyStatus"\s*:\s*"([^"]+)"',
-        r'"sgzt"\s*:\s*"([^"]+)"',
-        r'<span[^>]*class="[^"]*buyStatus[^"]*"[^>]*>([^<]+)</span>',
-    ]
-    for pattern in status_patterns:
-        match = re.search(pattern, html)
-        if match:
-            result["purchase_status_raw"] = match.group(1).strip()
-            break
+    # ---------- 申购状态 ----------
+    # 模式1: "交易状态：XXX" 或 "申购状态：XXX"（最常见）
+    # HTML格式可能是: 交易状态：</span><span class="staticCell">暂停申购 ...</span>
+    # 先用宽松匹配取整段文本，再strip HTML标签
+    trade_status_match = re.search(
+        r'(?:交易状态|申购状态)[：:]\s*'
+        r'((?:<[^>]+>)*\s*[^<]+(?:\s*<[^>]+>[^<]*)*)',  # 匹配HTML标签包裹的状态文本
+        html
+    )
+    if trade_status_match:
+        raw = trade_status_match.group(1).strip()
+        # 清理HTML残留 → 纯文本
+        raw = re.sub(r'<[^>]+>', '', raw)
+        raw = re.sub(r'\s+', ' ', raw).strip()
+        result["purchase_status_raw"] = raw
 
-    # 限额
-    limit_patterns = [
-        r'单日累计购买上限[：:]\s*([^<\s]+)',
-        r'日累计限定金额[：:]\s*([^<\s]+)',
-        r'"dayMaxAmt"\s*:\s*"?([^",}]+)"?',
-    ]
-    for pattern in limit_patterns:
-        match = re.search(pattern, html)
-        if match:
-            result["daily_limit_raw"] = match.group(1).strip()
-            break
+    # 如果上面的正则没匹配到（可能是纯文本无HTML标签的情况），降级尝试
+    if not result["purchase_status_raw"]:
+        # 尝试匹配到下一个HTML块结束或下一个"XX状态"标签
+        fallback = re.search(
+            r'(?:交易状态|申购状态)[：:]\s*(.+?)(?=<(?:/td|/div|br)|(?:开放|暂停)(?:申购|赎回|转换|定投)(?!\s*(?:上限|金额))|$)',
+            html
+        )
+        if fallback:
+            raw = fallback.group(1).strip()
+            raw = re.sub(r'<[^>]+>', '', raw)
+            raw = re.sub(r'\s+', ' ', raw).strip()
+            if raw:
+                result["purchase_status_raw"] = raw
+
+    # 模式2: JS变量 / data属性（备用）
+    if not result["purchase_status_raw"]:
+        js_patterns = [
+            r'"buyStatus"\s*:\s*"([^"]+)"',
+            r'"sgzt"\s*:\s*"([^"]+)"',
+            r'data-purchasestatus="([^"]+)"',
+        ]
+        for pattern in js_patterns:
+            match = re.search(pattern, html)
+            if match:
+                result["purchase_status_raw"] = match.group(1).strip()
+                break
+
+    # ---------- 限额 ----------
+    # 模式1: "单日累计购买上限XX元"（在交易状态行中）
+    limit_match = re.search(
+        r'单日(?:累计)?(?:购买|申购)上限[：:：\s]*([\d,.]+)\s*(?:元|万)?',
+        html
+    )
+    if limit_match:
+        raw_limit = limit_match.group(1).replace(',', '')
+        try:
+            result["daily_limit_raw"] = str(float(raw_limit))
+        except ValueError:
+            result["daily_limit_raw"] = raw_limit
+
+    # 模式2: JS变量
+    if not result["daily_limit_raw"]:
+        js_limit = re.search(r'"dayMaxAmt"\s*:\s*"?([^",}]+)"?', html)
+        if js_limit:
+            result["daily_limit_raw"] = js_limit.group(1).strip()
 
     return result
 
@@ -442,6 +555,40 @@ def _parse_announcements_from_html(html: str) -> list[dict]:
                 })
 
     return announcements[:10]
+
+
+def _normalize_purchase_status(raw_status: str) -> dict:
+    """将HTML中解析的原始状态标准化
+    返回: {"status": "开放申购|暂停申购|限大额|封闭期|未知", "daily_limit": 0}
+    """
+    if not raw_status:
+        return {"status": "未知", "daily_limit": 0}
+
+    raw = raw_status.strip()
+
+    # 提取单日限额
+    daily_limit = 0
+    limit_match = re.search(r'单日(?:累计)?(?:购买|申购)上限[：:：\s]*([\d,.]+)\s*(?:元|万)?', raw)
+    if limit_match:
+        try:
+            daily_limit = float(limit_match.group(1).replace(',', ''))
+        except ValueError:
+            pass
+
+    # 判断状态类型
+    if any(kw in raw for kw in ["封闭期", "暂停申购", "暂停赎回"]):
+        # 如果是定开基金（同时暂停申购和赎回），标记为"封闭期"
+        if "暂停申购" in raw and "暂停赎回" in raw:
+            return {"status": "封闭期(定开)", "daily_limit": 0}
+        return {"status": "暂停申购", "daily_limit": daily_limit}
+    elif "开放申购" in raw or "开放赎回" in raw:
+        if daily_limit > 0 and daily_limit < 100:
+            return {"status": "限大额", "daily_limit": daily_limit}
+        return {"status": "开放申购", "daily_limit": daily_limit if daily_limit > 0 else 999999}
+    elif "限" in raw or "限制" in raw:
+        return {"status": "限大额", "daily_limit": daily_limit}
+
+    return {"status": raw_status[:8], "daily_limit": daily_limit}
 
 
 def _check_announcement_concerns(announcements: list[dict]) -> dict:
@@ -527,23 +674,31 @@ async def verify_announcements_batch(candidates: list[dict]) -> list[dict]:
 
         if html:
             checked_count += 1
-            # 解析申购状态
+            # 解析申购状态（改进版：支持"交易状态"格式）
             status_info = _parse_purchase_status_from_html(html)
 
-            # 如果HTML中解析到了申购状态，更新item
+            # 标准化申购状态
             if status_info.get("purchase_status_raw"):
-                html_status = status_info["purchase_status_raw"]
-                current_status = item.get("purchase_status", "")
+                normalized = _normalize_purchase_status(status_info["purchase_status_raw"])
+                html_status = normalized["status"]
+                html_limit = normalized["daily_limit"]
 
-                # 如果状态不一致，以HTML为准
-                if "暂停" in html_status and "暂停" not in current_status:
+                # 用HTML解析结果覆盖未知状态
+                current_status = item.get("purchase_status", "未知")
+                if current_status == "未知" or not current_status:
+                    item["purchase_status"] = html_status
+                    item["daily_limit"] = html_limit
+                    item["purchase_status_source"] = "html_verified"
+                    if html_status != "未知":
+                        print(f"  ✓ {item['code']} {item['name']}: 申购状态 = {html_status}"
+                              + (f" (限额{html_limit:.0f}元)" if html_limit > 0 and html_limit < 999999 else ""))
+                elif "暂停" in html_status and "暂停" not in current_status:
+                    # 状态变更：原来是开放/未知，现在HTML显示暂停 → 立即更新
                     print(f"  🚨 {item['code']} {item['name']}: 申购状态变更 → {html_status}")
                     item["purchase_status"] = html_status
+                    item["daily_limit"] = html_limit
                     item["purchase_status_source"] = "html_verified"
-                    item["daily_limit"] = 0
                     warned_count += 1
-                elif "限" in html_status:
-                    item["purchase_status_source"] = "html_verified"
 
             # 解析公告
             announcements = _parse_announcements_from_html(html)
@@ -999,6 +1154,14 @@ async def get_all_lof_arbitrage_opportunities(use_mock: bool = False) -> dict:
         limits = {}
 
     lof_data = enrich_with_purchase_limits(lof_data, limits)
+
+    # Step 3.5: 用集思录申购状态覆盖东财的"未知"
+    try:
+        jisilu_info = await fetch_jisilu_data_full()
+        if jisilu_info:
+            lof_data = enrich_with_jisilu_status(lof_data, jisilu_info)
+    except Exception as e:
+        print(f"[主流程] 集思录数据获取失败（不影响主流程）: {e}")
 
     # Step 4: 最终筛选
     opportunities = filter_arbitrage_opportunities(lof_data)
