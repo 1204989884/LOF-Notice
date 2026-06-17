@@ -216,6 +216,45 @@ def enrich_with_jisilu_status(lof_data: list[dict], jisilu_info: dict[str, dict]
     return lof_data
 
 
+def _jisilu_dict_to_lof_list(jisilu_data: dict[str, dict]) -> list[dict]:
+    """
+    将 .jisilu_data.json 的扁平字典格式转换为流水线标准格式。
+    当东财/集思录API/AKShare全部不可用时，作为主数据源兜底。
+    
+    输入: {"160119": {"fund_id":..., "fund_nm":..., ...}, ...}
+    输出: [{"code":..., "name":..., "source":"jisilu_cache", ...}, ...]
+    """
+    results = []
+    for code, info in jisilu_data.items():
+        if not code:
+            continue
+        price = info.get("price", 0) or 0
+        volume = info.get("volume", 0) or 0  # 成交量(万份)
+        amount = info.get("amount", 0) or 0  # 份额(万份)
+
+        # 计算成交额: volume万份 × price元 ≈ 万元
+        turnover = float(volume) * float(price)
+
+        results.append({
+            "code": str(code),
+            "name": info.get("fund_nm", ""),
+            "price": float(price),
+            "nav": float(info.get("fund_nav", 0) or 0),
+            "nav_discount_rt": float(info.get("nav_discount_rt", 0) or 0),  # 集思录溢价率
+            "nav_verified": float(info.get("fund_nav", 0) or 0),
+            "premium_rt": float(info.get("nav_discount_rt", 0) or 0),
+            "volume": float(volume),
+            "amount": float(amount),
+            "turnover": turnover,
+            "change_pct": 0,  # 集思录缓存无此字段
+            "purchase_status": info.get("apply_status", "未知"),
+            "purchase_status_source": "jisilu_cache",
+            "daily_limit": 999999,  # 默认无限额（后续HTML核实更新）
+            "source": "jisilu_cache",
+        })
+    return results
+
+
 # ============================================================
 #  东方财富LOF列表（主力数据源，无需登录）
 # ============================================================
@@ -1124,13 +1163,22 @@ async def get_all_lof_arbitrage_opportunities(use_mock: bool = False) -> dict:
 
     # Step 1: 东方财富LOF列表（主力，无需登录，数据最全）
     lof_data = await fetch_lof_from_eastmoney()
-    if lof_data is None:
-        print("[主流程] 东方财富失败，尝试集思录...")
+    if lof_data is None or len(lof_data) == 0:
+        print("[主流程] 东方财富失败或无数据，尝试集思录...")
         lof_data = await fetch_jisilu_lof()
 
-    if lof_data is None:
-        print("[主流程] 集思录失败，尝试AKShare...")
+    if lof_data is None or len(lof_data) == 0:
+        print("[主流程] 集思录失败或无候选，尝试AKShare...")
         lof_data = await fetch_lof_data_akshare()
+
+    if lof_data is None or len(lof_data) == 0:
+        # 最终兜底：直接读取 .jisilu_data.json 作为主数据源
+        print("[主流程] AKShare失败或无候选，尝试本地集思录缓存作为主数据源...")
+        jisilu_full = await fetch_jisilu_data_full()
+        if jisilu_full:
+            lof_data = _jisilu_dict_to_lof_list(jisilu_full)
+            if lof_data:
+                print(f"[主流程] ✅ 本地集思录缓存可用: {len(lof_data)} 只LOF")
 
     if lof_data is None:
         print("[主流程] 所有数据源均失败")
