@@ -8,14 +8,20 @@ LOF套利机会数据获取模块
   Step 3: 公告核实 → 检查最近公告是否有暂停/限购变动
 """
 import asyncio
+import subprocess
 import time
 import json
 import re
 import os
 from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
+
+# 清除系统代理环境变量（避免 httpx/requests 走本地代理导致断连）
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+    os.environ.pop(_k, None)
 
 # ---------- 配置 ----------
 PREMIUM_THRESHOLD = 3.0          # 最终筛选溢价率阈值（%）
@@ -256,11 +262,69 @@ def _jisilu_dict_to_lof_list(jisilu_data: dict[str, dict]) -> list[dict]:
 
 
 # ============================================================
+#  curl 子进程调用（绕过 httpx TLS 指纹拦截）
+# ============================================================
+
+async def _curl_fetch_json(url: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
+    """
+    通过 curl 子进程请求 API 并返回 JSON。
+    原因：东财服务器对 Python OpenSSL 做 TLS 指纹拦截，
+    只有 curl（Windows schannel）能正常通话。
+    """
+    full_url = url
+    if params:
+        qs = urlencode(params, doseq=True)
+        full_url = f"{url}?{qs}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-s", "--max-time", str(timeout), full_url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout + 5)
+        if proc.returncode != 0:
+            print(f"[curl] 返回码 {proc.returncode}: {stderr.decode('utf-8', errors='replace')[:200]}")
+            return None
+        text = stdout.decode("utf-8", errors="replace")
+        if not text.strip():
+            return None
+        return json.loads(text)
+    except Exception as e:
+        print(f"[curl] 异常: {e}")
+        return None
+
+
+def _curl_fetch_json_sync(url: str, params: dict = None, timeout: int = 15) -> Optional[dict]:
+    """同步版 curl 子进程调用"""
+    full_url = url
+    if params:
+        qs = urlencode(params, doseq=True)
+        full_url = f"{url}?{qs}"
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", str(timeout), full_url],
+            capture_output=True, text=True, timeout=timeout + 5,
+            encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            print(f"[curl sync] 返回码 {result.returncode}: {result.stderr[:200]}")
+            return None
+        if not result.stdout.strip():
+            return None
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"[curl sync] 异常: {e}")
+        return None
+
+
+# ============================================================
 #  东方财富LOF列表（主力数据源，无需登录）
 # ============================================================
 
 async def fetch_lof_from_eastmoney() -> Optional[list[dict]]:
-    """从东方财富API获取所有LOF的实时行情（价格、成交量等）"""
+    """从东方财富API获取所有LOF的实时行情（价格、成交量等）
+    优先用 curl（绕过TLS指纹拦截），fallback 到 httpx"""
     params = {
         "pn": "1", "pz": "200", "po": "1", "np": "1",
         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -269,54 +333,156 @@ async def fetch_lof_from_eastmoney() -> Optional[list[dict]]:
         "fs": "b:MK0404,b:MK0405,b:MK0406,b:MK0407",
         "fields": "f2,f3,f4,f12,f14,f15,f16,f17,f20,f21",
     }
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://quote.eastmoney.com/",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            resp = await client.get(EM_LOF_URL, params=params, headers=headers)
-            data = resp.json()
-        rows = data.get("data", {}).get("diff", [])
-        if not rows:
-            return None
 
-        results = []
-        for row in rows:
-            code = str(row.get("f12", ""))
-            name = str(row.get("f14", ""))
-            price = _safe_float(row.get("f2", 0))
-            amount = _safe_float(row.get("f20", 0))
+    data = None
 
-            if not code or price <= 0 or amount < MIN_VOLUME:
-                continue
+    # 策略1: curl 子进程（绕过 TLS 指纹）
+    data = await _curl_fetch_json(EM_LOF_URL, params)
+    if data:
+        print("[东方财富] curl 获取成功")
+    else:
+        # 策略2: httpx fallback
+        print("[东方财富] curl 失败，尝试 httpx...")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
+                resp = await client.get(EM_LOF_URL, params=params, headers=headers)
+                data = resp.json()
+        except Exception as e:
+            print(f"[东方财富] httpx 也失败: {e}")
 
-            results.append({
-                "code": code,
-                "name": name,
-                "price": price,
-                "nav": 0,
-                "premium_rt": 0,
-                "volume": _safe_float(row.get("f15", 0)),
-                "amount": amount,
-                "apply_status": "未知",
-                "nav_date": "",
-                "issuer": "",
-                "turnover_rt": 0,
-                "source": "eastmoney",
-            })
-
-        print(f"[东方财富] 获取到 {len(results)} 只LOF行情数据")
-        return results
-
-    except Exception as e:
-        print(f"[东方财富] 异常: {e}")
+    if not data:
         return None
 
+    rows = data.get("data", {}).get("diff", [])
+    if not rows:
+        return None
+
+    results = []
+    for row in rows:
+        code = str(row.get("f12", ""))
+        name = str(row.get("f14", ""))
+        price = _safe_float(row.get("f2", 0))
+        amount = _safe_float(row.get("f20", 0))
+
+        if not code or price <= 0 or amount < MIN_VOLUME:
+            continue
+
+        results.append({
+            "code": code,
+            "name": name,
+            "price": price,
+            "nav": 0,
+            "premium_rt": 0,
+            "volume": _safe_float(row.get("f15", 0)),
+            "amount": amount,
+            "apply_status": "未知",
+            "nav_date": "",
+            "issuer": "",
+            "turnover_rt": 0,
+            "source": "eastmoney",
+        })
+
+    print(f"[东方财富] 获取到 {len(results)} 只LOF行情数据（总计 {data.get('data', {}).get('total', 0)} 只）")
+    return results
+
 
 # ============================================================
-#  Step 2: 天天基金净值核实
+#  腾讯财经LOF行情（免代理，稳定可靠）
 # ============================================================
+
+def _parse_tencent_quote(line: str) -> Optional[dict]:
+    """解析腾讯财经单只基金行情数据"""
+    # 格式: v_sz161226="51~名称~代码~现价~昨收~开盘~成交量~..."
+    match = re.match(r'v_(\w+)="(.+)"', line.strip())
+    if not match:
+        return None
+
+    market_code = match.group(1)  # 如 sz161226 或 sh501032
+    fields = match.group(2).split("~")
+    if len(fields) < 7:
+        return None
+
+    code = fields[2] if len(fields) > 2 else ""
+    name = fields[1] if len(fields) > 1 else ""
+    price = _safe_float(fields[3])
+    volume = _safe_float(fields[6])  # 成交量(股)
+
+    # 成交额 = 价格 × 成交量 / 100 (基金按手交易，1手=100份)
+    amount = price * volume if price > 0 and volume > 0 else 0
+
+    return {
+        "code": code,
+        "name": name,
+        "price": price,
+        "nav": 0,
+        "premium_rt": 0,
+        "volume": volume,
+        "amount": amount,
+        "apply_status": "未知",
+        "nav_date": "",
+        "issuer": "",
+        "turnover_rt": 0,
+        "source": "tencent",
+    }
+
+
+async def _fetch_tencent_batch(codes: list[str]) -> list[dict]:
+    """批量从腾讯财经获取LOF行情（每批最多50只）"""
+    results = []
+    batch_size = 50
+
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+        code_str = ",".join(batch)
+        url = f"{TENCENT_URL}{code_str}"
+
+        try:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
+                resp = await client.get(url)
+                resp.encoding = "gbk"
+                text = resp.text
+
+            for line in text.strip().split("\n"):
+                if not line.strip() or "=" not in line:
+                    continue
+                parsed = _parse_tencent_quote(line)
+                if parsed and parsed["code"] and parsed["price"] > 0:
+                    results.append(parsed)
+
+        except Exception as e:
+            print(f"[腾讯财经] 批次 {i // batch_size + 1} 失败: {e}")
+            continue
+
+    print(f"[腾讯财经] 获取到 {len(results)} 只LOF实时行情")
+    return results
+
+
+async def fetch_lof_from_tencent(lof_codes: list[str] = None) -> Optional[list[dict]]:
+    """从腾讯财经获取LOF实时行情（主数据源备用，免代理）
+    
+    lof_codes: LOF代码列表，如 ["sz161226", "sh501032"]
+    如果未提供，则从集思录缓存获取代码列表
+    """
+    if not lof_codes:
+        # 从集思录缓存获取代码列表
+        jisilu_data = await fetch_jisilu_data_full()
+        if jisilu_data:
+            lof_codes = []
+            for code in jisilu_data:
+                # 6位代码：1开头=深交所(sz)，5开头=上交所(sh)
+                prefix = "sz" if str(code).startswith("1") else "sh"
+                lof_codes.append(f"{prefix}{code}")
+            print(f"[腾讯财经] 从集思录缓存获取 {len(lof_codes)} 个LOF代码")
+
+    if not lof_codes:
+        print("[腾讯财经] 无LOF代码，跳过")
+        return None
+
+    return await _fetch_tencent_batch(lof_codes)
 
 async def _fetch_single_nav_ttjj(client: httpx.AsyncClient, code: str) -> Optional[dict]:
     """获取单只基金的最新净值（含净值日期和估算净值）"""
@@ -368,7 +534,7 @@ async def verify_navs_batch(candidates: list[dict]) -> list[dict]:
     async def verify_one(item: dict) -> dict:
         nonlocal verified_count
         async with semaphore:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
                 result = await _fetch_single_nav_ttjj(client, item["code"])
                 await asyncio.sleep(0.2)  # 礼貌间隔
 
@@ -707,7 +873,7 @@ async def verify_announcements_batch(candidates: list[dict]) -> list[dict]:
     async def check_one(item: dict) -> dict:
         nonlocal checked_count, warned_count
         async with semaphore:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
                 html = await _fetch_fund_page_html(client, item["code"])
                 await asyncio.sleep(0.3)
 
@@ -791,7 +957,7 @@ async def fetch_purchase_limits() -> dict[str, dict]:
     max_pages = 5
 
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
             while page_index <= max_pages:
                 params = {
                     "pageIndex": str(page_index),
@@ -855,7 +1021,7 @@ async def fetch_tencent_prices(codes: list[str]) -> dict[str, dict]:
 
     results = {}
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT, trust_env=False) as client:
             resp = await client.get(url)
             resp.encoding = "gbk"
             text = resp.text
@@ -1164,11 +1330,15 @@ async def get_all_lof_arbitrage_opportunities(use_mock: bool = False) -> dict:
     # Step 1: 东方财富LOF列表（主力，无需登录，数据最全）
     lof_data = await fetch_lof_from_eastmoney()
     if lof_data is None or len(lof_data) == 0:
-        print("[主流程] 东方财富失败或无数据，尝试集思录...")
+        print("[主流程] 东方财富失败或无数据，尝试集思录API...")
         lof_data = await fetch_jisilu_lof()
 
     if lof_data is None or len(lof_data) == 0:
-        print("[主流程] 集思录失败或无候选，尝试AKShare...")
+        print("[主流程] 集思录API失败，尝试腾讯财经...")
+        lof_data = await fetch_lof_from_tencent()
+
+    if lof_data is None or len(lof_data) == 0:
+        print("[主流程] 腾讯财经失败或无候选，尝试AKShare...")
         lof_data = await fetch_lof_data_akshare()
 
     if lof_data is None or len(lof_data) == 0:

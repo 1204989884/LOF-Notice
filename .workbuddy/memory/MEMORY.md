@@ -73,3 +73,20 @@ C:/Users/Administrator/.workbuddy/binaries/python/envs/lofnotice/Scripts/python.
 - 格式："交易状态：暂停申购 （单日累计购买上限10.00元） 开放赎回"
 - 标准化：开放申购/暂停申购/封闭期(定开)/限大额
 - 备选：集思录 apply_status（需手动更新.jisilu_data.json）
+
+## 卖出价格获取（已修复 2026-06-22）
+- **问题**: sell接口只在当日screened数据中查找价格，T+2到期的持仓若已不在筛选列表中则无法卖出
+- **修复**: main.py sell_position增加腾讯财经API兜底 → `_fetch_price_from_tencent(code)` 
+- 先查缓存opportunities，找不到则调用qt.gtimg.cn获取实时价
+
+## 每日自动化惯例（2026-06-22确认）
+- 每日14:40定时执行：刷新数据 → 自动买入所有可申购品种 → 自动卖出T+2到期品种
+- 买入/卖出均在 main.py refresh_cache() 中自动完成，无需手动调用
+- 买入后输出：[买入] + 品种详情；T+2到期自动：[卖出] + 盈亏
+- 同一天同一基金不重复买入；不在当日数据中的持仓从腾讯财经获取价格卖出
+
+## 东财API问题（2026-06-20诊断）
+- **根因**: Python OpenSSL TLS指纹被东财服务器拦截；系统代理封堵push2.eastmoney.com
+- **修复**: 新增腾讯财经API(qt.gtimg.cn)作为实时行情主源，免代理直连
+- **数据优先级**: 东财(curl) → 集思录API → 腾讯财经(新) → AKShare → 本地缓存
+- **注**: 周六非交易日，数据为周五收盘价+最新净值，属正常
