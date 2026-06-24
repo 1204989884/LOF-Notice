@@ -73,7 +73,8 @@ function buildTable(data) {
     var p = item.premium_rt || 0;
     var pc = p > 0 ? 'red' : 'green';
     h += '<tr>';
-    h += '<td class="code">' + item.code + '</td>';
+    var detailUrl = 'https://fundf10.eastmoney.com/' + item.code + '.html';
+    h += '<td class="code"><a href="' + detailUrl + '" target="_blank" style="color:#4af;text-decoration:none" title="查看溢价详情">' + item.code + '</a></td>';
     h += '<td>' + (item.name||'').substring(0,20) + '</td>';
     h += '<td>' + (item.price||0).toFixed(3) + '</td>';
     h += '<td>' + (item.nav||0).toFixed(4) + '</td>';
@@ -84,7 +85,7 @@ function buildTable(data) {
     h += '<td>' + formatLimit(item.daily_limit) + '</td>';
     h += '<td>' + ((item.purchase_fee||0).toFixed(2)) + '%</td>';
     h += '<td>' + riskBadge(item) + '</td>';
-    h += '<td><a href="' + (item.ann_url || '#') + '" target="_blank" style="color:#4af">Link</a></td>';
+    h += '<td><a href="' + (item.ann_url || '#') + '" target="_blank" style="color:#4af">公告</a></td>';
     h += '</tr>';
   }
   h += '</table>';
