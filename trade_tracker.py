@@ -212,8 +212,15 @@ def auto_buy_opportunities(opportunities: list[dict]) -> list[dict]:
     """
     对符合条件的机会自动模拟买入
     条件：溢价>3% + 开放申购（或限大额且日限额>=100）+ 成交额>1万
+    有色/资源类LOF溢价需>5%才买入
     返回：新买入的交易列表
     """
+    # 有色/资源类关键词（与fetcher.py保持一致）
+    RESOURCE_KW = ["有色", "资源", "大宗商品", "煤炭", "钢铁", "矿业", "黄金", "白银"]
+
+    def _is_resource(name: str) -> bool:
+        return any(kw in name for kw in RESOURCE_KW)
+
     new_trades = []
     today = get_today_str()
 
@@ -240,7 +247,9 @@ def auto_buy_opportunities(opportunities: list[dict]) -> list[dict]:
 
         # 溢价检查
         premium = opp.get("premium_rt", 0)
-        if abs(premium) < 3:
+        name = opp.get("name", "")
+        min_premium = 5.0 if _is_resource(name) else 3.0
+        if abs(premium) < min_premium:
             continue
 
         # 使用核实后的净值

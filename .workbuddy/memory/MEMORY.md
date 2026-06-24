@@ -40,6 +40,7 @@ C:/Users/Administrator/.workbuddy/binaries/python/envs/lofnotice/Scripts/python.
 
 ## 套利筛选条件
 - 溢价率绝对值 > 3%
+- **有色/资源类LOF（名称含"有色""资源""大宗商品""煤炭"等）溢价阈值提升至 > 5%**（2026-06-24确定：有色类溢价虚，6/22批次6只有色全亏）
 - 成交额 > 10000元
 - 申购状态非"暂停申购"
 - 日限额 >= 100元或无限额
@@ -90,3 +91,9 @@ C:/Users/Administrator/.workbuddy/binaries/python/envs/lofnotice/Scripts/python.
 - **修复**: 新增腾讯财经API(qt.gtimg.cn)作为实时行情主源，免代理直连
 - **数据优先级**: 东财(curl) → 集思录API → 腾讯财经(新) → AKShare → 本地缓存
 - **注**: 周六非交易日，数据为周五收盘价+最新净值，属正常
+
+## 自动卖出BUG（发现 2026-06-24）
+- **问题**: refresh_cache 中 auto-sell 逻辑在 `if result.get("data"):` 块内（第51行）
+- 当 result["data"] 为空（0机会）时，T+2到期的持仓不会被自动卖出
+- 影响：6/24 16笔到期持仓未自动平仓
+- **需修复**: 将 auto-sell（lines 73-86）移到 `if result.get("data"):` 块外面

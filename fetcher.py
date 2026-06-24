@@ -24,7 +24,8 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"
     os.environ.pop(_k, None)
 
 # ---------- 配置 ----------
-PREMIUM_THRESHOLD = 3.0          # 最终筛选溢价率阈值（%）
+PREMIUM_THRESHOLD = 3.0          # 最终筛选溢价率阈值（%），有色/资源类提升至5%
+PREMIUM_PRESCREEN = 1.5         # 初筛阈值（%），设低一点避免漏掉
 PREMIUM_PRESCREEN = 1.5         # 初筛阈值（%），设低一点避免漏掉
 MIN_VOLUME = 100000            # 最低成交额（元），低于10万标记为流动性差
 MIN_VOLUME_WARN = 500000       # 低于50万标黄色警告
@@ -1129,10 +1130,22 @@ def enrich_with_purchase_limits(lof_data: list[dict], limits: dict[str, dict]) -
     return lof_data
 
 
+RESOURCE_KEYWORDS = ["有色", "资源", "大宗商品", "煤炭", "钢铁", "矿业", "黄金", "白银"]
+
+
+def _is_resource_lof(name: str) -> bool:
+    """判断是否有色/资源类LOF"""
+    for kw in RESOURCE_KEYWORDS:
+        if kw in name:
+            return True
+    return False
+
+
 def filter_arbitrage_opportunities(data: list[dict]) -> list[dict]:
     """
     最终筛选：用「核实溢价率」做筛选条件
     不按申购状态过滤——暂停申购的也展示，让用户自行判断
+    有色/资源类LOF溢价阈值提升至5%（溢价虚，历史表现差）
     """
     opportunities = []
     for item in data:
@@ -1140,8 +1153,11 @@ def filter_arbitrage_opportunities(data: list[dict]) -> list[dict]:
         amount = item.get("amount", 0)
         price = item.get("price", 0)
         nav = item.get("nav_verified", item.get("nav", 0))
+        name = item.get("name", "")
 
-        if abs(premium) < PREMIUM_THRESHOLD:
+        # 有色/资源类LOF：溢价阈值提高到5%
+        threshold = 5.0 if _is_resource_lof(name) else PREMIUM_THRESHOLD
+        if abs(premium) < threshold:
             continue
         if price <= 0 or nav <= 0:
             continue
