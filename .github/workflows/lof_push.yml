@@ -1,0 +1,29 @@
+name: LOF套利监测推送
+
+on:
+  schedule:
+    # 北京时间 11:31（UTC 03:31）周一至周五
+    - cron: '31 3 * * 1-5'
+    # 北京时间 14:40（UTC 06:40）周一至周五
+    - cron: '40 6 * * 1-5'
+  workflow_dispatch:  # 允许手动触发测试
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 执行推送
+        env:
+          SENDKEY: ${{ secrets.SENDKEY }}
+        run: python gh_push.py
